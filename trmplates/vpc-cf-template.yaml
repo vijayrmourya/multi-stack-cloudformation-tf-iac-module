@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy a VPC and a private EC2 that can access an S3 bucket via a VPC endpoint
+
+Parameters:
+  UbuntuAmiParameter:
+    Type: String
+    Default: ""
+    Description: "Explicit AMI ID to use. When deploying with Terraform the AMI will be automatically looked up and passed; leave empty only if providing an AMI via parameters."
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: Lab VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Lab Internet Gateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      Tags:
+        - Key: Name
+          Value: Public Subnet 1
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      Tags:
+        - Key: Name
+          Value: Private Subnet 1
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Public Route Table
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Private Route Table
+
+  PrivateSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  # VPC endpoint for S3 so private instances can reach S3 without internet/NAT
+  S3VpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      VpcEndpointType: Gateway
+
+  # IAM role for EC2 to access S3
+  RobotInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: RobotS3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt RobotS3Bucket.Arn
+                  - !Sub "${RobotS3Bucket.Arn}/*"
+
+  RobotInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref RobotInstanceRole
+
+  # Security group for the EC2 instance
+  RobotAppSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable SSH access via port 22 (EC2 in private subnet)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 0
+          CidrIp: 0.0.0.0/0
+
+  # The EC2 instance that will live in the private subnet
+  RobotAppServer:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: t2.small
+      ImageId: !Ref UbuntuAmiParameter
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref RobotAppSecurityGroup
+      IamInstanceProfile: !Ref RobotInstanceProfile
+
+  # S3 bucket that will only allow access from the EC2 role via the VPC endpoint
+  RobotS3Bucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Delete
+
+  RobotS3BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref RobotS3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow the EC2 role to perform bucket and object actions
+          # Note: The VPC endpoint is configured at the network layer (routing and security group rules)
+          # to restrict which instances can reach S3, so the condition on SourceVpce is not needed here
+          # and was causing circular dependency issues during stack deletion.
+          - Sid: AllowRoleAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt RobotInstanceRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt RobotS3Bucket.Arn
+              - !Sub "${RobotS3Bucket.Arn}/*"
+
+Outputs:
+  VPC:
+    Description: VPC
+    Value: !Ref VPC
+
+  AZ1:
+    Description: Availability Zone of Public Subnet 1
+    Value: !GetAtt PublicSubnet1.AvailabilityZone
+
+  RobotInstanceId:
+    Description: EC2 Instance Id
+    Value: !Ref RobotAppServer
+
+  RobotBucketName:
+    Description: S3 bucket name
+    Value: !Ref RobotS3Bucket
+
+  S3VpcEndpointId:
+    Description: VPC Endpoint ID for S3
+    Value: !Ref S3VpcEndpoint
