@@ -1,4 +1,4 @@
-# iac-with-cloudformation
+# multi-stack-cloudformation-tf-iac-module
 
 ## AWS VPC + Private EC2 + S3 with CloudFormation & Terraform
 
